@@ -96,18 +96,18 @@ This copies the conversation log into `~/.claude-sandbox/projects/-workspace/` a
 
 ### Importing from ClaudeBox
 
-ClaudeBox stores each project under `~/.claudebox/projects/<project-name>/`. The original folder path is in `.project_path` and session JSONL files are nested inside `<session-id>/.claude/`.
+ClaudeBox stores each project under `~/.claudebox/projects/<project-name>/`. The original folder path is in `.project_path` and session JSONL files are nested inside `<8-char-hex-id>/.claude/projects/-workspace/`.
 
 ```bash
 # Read the folder path for a ClaudeBox project
 cat ~/.claudebox/projects/my-project/.project_path
 
-# List the sessions available for that project
+# List the instance folders for that project
 ls ~/.claudebox/projects/my-project/
 
 # Import a specific session
 ./claude-sandbox register-session \
-  ~/.claudebox/projects/my-project/<session-id>/.claude/projects/-workspace/<conversation-id>.jsonl \
+  ~/.claudebox/projects/my-project/<instance-id>/.claude/projects/-workspace/<conversation-id>.jsonl \
   "$(cat ~/.claudebox/projects/my-project/.project_path)"
 ```
 
@@ -115,7 +115,7 @@ If there are multiple `.jsonl` files inside `-workspace/`, use `view-session` wi
 
 ```bash
 ./claude-sandbox view-session \
-  ~/.claudebox/projects/my-project/<session-id>/.claude/projects/-workspace/<conversation-id>.jsonl
+  ~/.claudebox/projects/my-project/<instance-id>/.claude/projects/-workspace/<conversation-id>.jsonl
 ```
 
 ## What it does
