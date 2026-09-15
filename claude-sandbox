@@ -1,0 +1,625 @@
+#!/usr/bin/env bash
+
+# Exit on error, undefined variables, and pipe failures — prevents silent failures
+set -euo pipefail
+
+# Stores credentials, session history, and conversation logs
+CLAUDE_HOME="$HOME/.claude-sandbox"
+
+# Our own index inside CLAUDE_HOME — maps session IDs to host folder paths for the resume command.
+# Everything else in CLAUDE_HOME is managed by Claude Code itself.
+SESSIONS_DIR="$CLAUDE_HOME/session-index"
+
+# Passed to every session container via sh -c.
+# Copies claude.json from the container filesystem into the mounted volume on any exit
+# (clean quit, Ctrl+C, or crash) so credentials persist for future sessions.
+# claude.json lives at /root/.claude.json — outside the /root/.claude/ volume — so it
+# must be explicitly copied each time.
+_SAVE_CREDENTIALS_TRAP='
+  _save_credentials() {
+    cp /root/.claude.json /root/.claude/claude.json 2>/dev/null || {
+      backup=$(ls /root/.claude/backups/.claude.json.backup.* 2>/dev/null | sort | tail -1)
+      [ -n "$backup" ] && cp "$backup" /root/.claude/claude.json
+    }
+    true
+  }
+  trap _save_credentials EXIT
+'
+
+# log "hello world" prints [claude-sandbox] hello world.
+log() {
+    echo "[claude-sandbox] $*";
+}
+
+confirm() {
+  # Read from /dev/tty directly so it works even when stdin is redirected
+  read -r -p "$* [y/N] " reply </dev/tty
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# Reject session IDs that could escape SESSIONS_DIR via path traversal.
+# A session ID is always a UUID (hex digits and hyphens), so anything else
+# is either a mistake or a crafted value like "../../some/file" that would
+# resolve to an arbitrary path when concatenated with SESSIONS_DIR.
+validate_session_id() {
+  [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]] || { log "Error: invalid session ID '$1'." >&2; exit 1; }
+}
+
+# Read a single key=value field from a session index file.
+# The || true prevents grep's exit code 1 (no match) from failing under pipefail.
+read_session_field() {
+  { grep "^$2=" "$1" || true; } | cut -d= -f2-
+}
+
+# Create a new session index file.
+# For forks, pass source_id to record the forked_from field.
+write_session_file() {
+  local session_file="$1" folder="$2" source_id="${3:-}"
+  {
+    echo "folder=$folder"
+    if [[ -n "$source_id" ]]; then
+      echo "forked_from=$source_id"
+    fi
+  } > "$session_file"
+}
+
+# Output session IDs sorted by last_active descending (most recent first).
+sort_sessions_by_last_active() {
+  if [[ $# -eq 0 ]]; then return; fi
+  local sid la
+  for sid in "$@"; do
+    la=$(session_timestamps "$sid" | sed -n '2p')
+    printf '%s|%s\n' "${la:--}" "$sid"
+  done | LC_ALL=C sort -r | cut -d'|' -f2
+}
+
+# Read created (first entry) and last_active (last entry) timestamps from a session's JSONL.
+# Outputs two lines: created, last_active. Outputs "-" for each if the JSONL is not found.
+session_timestamps() {
+  local session_id="$1"
+  local jsonl_file
+  jsonl_file=$(find "$CLAUDE_HOME/projects" -name "${session_id}.jsonl" 2>/dev/null | head -1)
+  if [[ -z "$jsonl_file" ]]; then
+    printf -- "-\n-\n"
+    return
+  fi
+  jq -rs '[.[] | select(.timestamp) | .timestamp] | (first // "-"), (last // "-")' "$jsonl_file" \
+    | sed 's/T/ /; s/\..*//'
+}
+
+# All container invocations go through here.
+# Callers pass docker flags, then --, then the container command:
+#   run_container -it -v "$folder":/workspace -- npx --yes @anthropic-ai/claude-code
+# expands to:
+#   docker run --rm -v CLAUDE_HOME:/root/.claude -it -v "$folder":/workspace node:20-slim npx --yes @anthropic-ai/claude-code
+# -- separates docker flags (before) from the container command (after),
+# so docker options land before the image name as required by docker run syntax.
+run_container() {
+  local -a docker_flags=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do
+    docker_flags+=("$1")
+    shift
+  done
+  shift  # remove the -- separator
+
+  local -a config_mount=()
+  if [[ -f "$CLAUDE_HOME/claude.json" ]]; then
+    # claude.json lives at /root/.claude.json — outside the /root/.claude/ volume.
+    # We saved a copy to $CLAUDE_HOME/claude.json at login; mount it back each run.
+    config_mount=(-v "$CLAUDE_HOME/claude.json":/root/.claude.json)
+  fi
+
+  docker run \
+    --rm \
+    `# delete container on exit` \
+    -v "$CLAUDE_HOME":/root/.claude \
+    `# credentials and history always available` \
+    "${config_mount[@]}" \
+    "${docker_flags[@]}" \
+    node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 \
+    `# minimal Node image; Claude Code is a Node app — pinned to digest for supply chain safety` \
+    "$@"
+}
+
+fix_ownership() {
+  log "Fixing ownership of $CLAUDE_HOME"
+  # The container runs as root, so all files it writes are root-owned on the host.
+  # This makes them unreadable by the current user — chown fixes that.
+  run_container -- chown -R "$(id -u):$(id -g)" /root/.claude
+}
+
+record_session() {
+  local folder="$1"
+  local snapshot="$2"
+  local source_id="${3:-}"
+
+  log "Looking for new session file"
+
+  # Claude Code does not expose the session ID it creates, so we detect it by comparing
+  # the list of .jsonl files before and after the run.
+  # comm -13 outputs lines only in the second input — i.e. files that didn't exist before.
+  # snapshot (before):  abc.jsonl / def.jsonl
+  # find output (after): abc.jsonl / def.jsonl / ghi.jsonl
+  # comm -13 result:    ghi.jsonl  <- the new session
+  local new_session
+  new_session=$(comm -13 \
+    <(echo "$snapshot") \
+    <(find "$CLAUDE_HOME/projects" -name "*.jsonl" 2>/dev/null | sort) | head -1)
+
+  if [[ -n "$new_session" ]]; then
+    # Strip directory and .jsonl extension to get the UUID
+    local session_id
+    session_id=$(basename "$new_session" .jsonl)
+    validate_session_id "$session_id"
+    mkdir -p "$SESSIONS_DIR"
+    write_session_file "$SESSIONS_DIR/$session_id" "$folder" "$source_id"
+    log "Session recorded: $session_id -> $folder"
+  else
+    log "No new session file detected"
+  fi
+}
+
+sessions_for_folder() {
+  local folder
+  folder=$(realpath "$1")
+
+  if [[ ! -d "$SESSIONS_DIR" ]] || [[ -z "$(ls -A "$SESSIONS_DIR" 2>/dev/null)" ]]; then
+    log "No sessions recorded yet."
+    return
+  fi
+
+  # First pass: collect data for sessions matching this folder; separate roots from forks.
+  declare -A s_forked_from
+  local -a root_ids=()
+  for f in "$SESSIONS_DIR"/*; do
+    local sid
+    sid=$(basename "$f")
+    if [[ "$(read_session_field "$f" folder)" == "$folder" ]]; then
+      s_forked_from[$sid]=$(read_session_field "$f" forked_from)
+      if [[ -z "${s_forked_from[$sid]}" ]]; then
+        root_ids+=("$sid")
+      fi
+    fi
+  done
+
+  if [[ ${#root_ids[@]} -eq 0 ]]; then
+    log "No sessions found for folder: $folder"
+    return
+  fi
+
+  echo ""
+  printf "%-40s  %-20s  %-20s\n" "SESSION ID" "CREATED" "LAST ACTIVE"
+  printf "%-40s  %-20s  %-20s\n" "----------" "-------" "-----------"
+
+  # Second pass: print root sessions sorted by last_active, each followed by its descendants.
+  local sorted_sid
+  while IFS= read -r sorted_sid; do
+    local ts created last_active
+    ts=$(session_timestamps "$sorted_sid")
+    created=$(echo "$ts" | sed -n '1p')
+    last_active=$(echo "$ts" | sed -n '2p')
+    printf "%-40s  %-20s  %-20s\n" "$sorted_sid" "$created" "$last_active"
+
+    local -a queue=("0|$sorted_sid")
+    while [[ ${#queue[@]} -gt 0 ]]; do
+      local entry cur_depth parent next_depth
+      entry="${queue[0]}"
+      queue=("${queue[@]:1}")
+      cur_depth="${entry%%|*}"
+      parent="${entry#*|}"
+      next_depth=$(( cur_depth + 1 ))
+
+      local -a fork_children=()
+      for f in "$SESSIONS_DIR"/*; do
+        local fsid
+        fsid=$(basename "$f")
+        if [[ "${s_forked_from[$fsid]:-}" == "$parent" ]]; then fork_children+=("$fsid"); fi
+      done
+
+      local sorted_fsid
+      while IFS= read -r sorted_fsid; do
+        local fts flast_active
+        fts=$(session_timestamps "$sorted_fsid")
+        flast_active=$(echo "$fts" | sed -n '2p')
+        printf "%*s(fork) %-32s  %-20s  %-20s\n" \
+          "$(( next_depth * 2 - 1 ))" "" "$sorted_fsid" "" "$flast_active"
+        queue+=("$next_depth|$sorted_fsid")
+      done < <(sort_sessions_by_last_active "${fork_children[@]}")
+    done
+  done < <(sort_sessions_by_last_active "${root_ids[@]}")
+
+  echo ""
+}
+
+list_sessions() {
+  if [[ ! -d "$SESSIONS_DIR" ]] || [[ -z "$(ls -A "$SESSIONS_DIR" 2>/dev/null)" ]]; then
+    log "No sessions recorded yet."
+    return
+  fi
+
+  echo ""
+  printf "%-40s  %-20s  %-20s  %s\n" "SESSION ID" "CREATED" "LAST ACTIVE" "FOLDER"
+  printf "%-40s  %-20s  %-20s  %s\n" "----------" "-------" "-----------" "------"
+
+  # First pass: collect folder and forked_from for all sessions; separate roots from forks.
+  declare -A s_folder s_forked_from
+  local -a root_ids=()
+  for f in "$SESSIONS_DIR"/*; do
+    local sid
+    sid=$(basename "$f")
+    s_folder[$sid]=$(read_session_field "$f" folder)
+    s_forked_from[$sid]=$(read_session_field "$f" forked_from)
+    if [[ -z "${s_forked_from[$sid]}" ]]; then
+      root_ids+=("$sid")
+    fi
+  done
+
+  # Second pass: print root sessions sorted by last_active, each followed by its descendants.
+  local sorted_sid
+  while IFS= read -r sorted_sid; do
+    local ts created last_active
+    ts=$(session_timestamps "$sorted_sid")
+    created=$(echo "$ts" | sed -n '1p')
+    last_active=$(echo "$ts" | sed -n '2p')
+    printf "%-40s  %-20s  %-20s  %s\n" "$sorted_sid" "$created" "$last_active" "${s_folder[$sorted_sid]}"
+
+    # Queue entries are "depth|session_id"; depth drives indentation for nested forks.
+    local -a queue=("0|$sorted_sid")
+    while [[ ${#queue[@]} -gt 0 ]]; do
+      local entry cur_depth parent next_depth
+      entry="${queue[0]}"
+      queue=("${queue[@]:1}")
+      cur_depth="${entry%%|*}"
+      parent="${entry#*|}"
+      next_depth=$(( cur_depth + 1 ))
+
+      # Collect forks of this parent, sort by last_active, print and enqueue.
+      local -a fork_children=()
+      for f in "$SESSIONS_DIR"/*; do
+        local fsid
+        fsid=$(basename "$f")
+        if [[ "${s_forked_from[$fsid]:-}" == "$parent" ]]; then fork_children+=("$fsid"); fi
+      done
+
+      local sorted_fsid
+      while IFS= read -r sorted_fsid; do
+        local fts flast_active
+        fts=$(session_timestamps "$sorted_fsid")
+        flast_active=$(echo "$fts" | sed -n '2p')
+        printf "%*s(fork) %-32s  %-20s  %-20s  %s\n" \
+          "$(( next_depth * 2 - 1 ))" "" "$sorted_fsid" "" "$flast_active" "${s_folder[$sorted_fsid]:-}"
+        queue+=("$next_depth|$sorted_fsid")
+      done < <(sort_sessions_by_last_active "${fork_children[@]}")
+    done
+  done < <(sort_sessions_by_last_active "${root_ids[@]}")
+
+  echo ""
+}
+
+view_session() {
+  local jsonl_file
+  # Discriminate by checking if the argument resolves to an existing file.
+  # A session ID (UUID) won't match unless there happens to be a file with that exact name
+  # in the current directory — avoidable by passing an explicit path (e.g. ./uuid).
+  if [[ -f "$1" ]]; then
+    jsonl_file="$1"
+  else
+    validate_session_id "$1"
+    jsonl_file=$(find "$CLAUDE_HOME/projects" -name "${1}.jsonl" 2>/dev/null | head -1)
+    if [[ -z "$jsonl_file" ]]; then
+      log "Error: no session file found for $1" >&2
+      exit 1
+    fi
+  fi
+
+  # Extract user and assistant messages from the JSONL.
+  # User entries have message.content as a plain string.
+  # Assistant entries have message.content as an array — we extract only "text" blocks,
+  # skipping "thinking" blocks which contain internal reasoning.
+  # User messages starting with "<" are system/command injections, not real user input.
+  jq -r '
+    select(.type == "user" or .type == "assistant") |
+    select(.isMeta != true) |
+    if .type == "user" then
+      select(.message.content | type == "string") |
+      select(.message.content | startswith("<") | not) |
+      (
+        "\n\u001b[1;36m╔══ USER ══════════════════════════════════════════╗\u001b[0m",
+        "\u001b[2m  " + (.timestamp | gsub("T"; " ") | gsub("\\..*$"; "")) + "\u001b[0m",
+        "",
+        (.message.content | split("\n") | map("  " + .) | join("\n"))
+      )
+    else
+      (.message.content // [] | map(select(.type == "text") | .text) | join("")) |
+      select(length > 0) |
+      (
+        "\n\u001b[1;35m╔══ ASSISTANT ═════════════════════════════════════╗\u001b[0m",
+        "",
+        (split("\n") | map("  " + .) | join("\n"))
+      )
+    end
+  ' "$jsonl_file"
+}
+
+register_session() {
+  local jsonl_path
+  jsonl_path=$(realpath "$1")
+  local folder
+  folder=$(realpath "$2")
+
+  if [[ ! -f "$jsonl_path" ]]; then
+    log "Error: '$jsonl_path' is not a file." >&2
+    exit 1
+  fi
+
+  if [[ "$jsonl_path" != *.jsonl ]]; then
+    log "Error: '$jsonl_path' does not have a .jsonl extension." >&2
+    exit 1
+  fi
+
+  local session_id
+  session_id=$(basename "$jsonl_path" .jsonl)
+  validate_session_id "$session_id"
+
+  if [[ -f "$SESSIONS_DIR/$session_id" ]]; then
+    log "Error: session '$session_id' is already registered." >&2
+    exit 1
+  fi
+
+  local dest_dir="$CLAUDE_HOME/projects/-workspace"
+  mkdir -p "$dest_dir"
+
+  echo ""
+  log "Will register:"
+  log "  session: $session_id"
+  log "  folder:  $folder"
+  log "  copy:    $jsonl_path -> $dest_dir/$session_id.jsonl"
+  echo ""
+
+  confirm "Register session?" || { log "Aborted."; exit 0; }
+
+  cp "$jsonl_path" "$dest_dir/$session_id.jsonl"
+  mkdir -p "$SESSIONS_DIR"
+  write_session_file "$SESSIONS_DIR/$session_id" "$folder"
+  log "Session $session_id registered."
+}
+
+delete_session() {
+  local session_id="$1"
+  validate_session_id "$session_id"
+  local session_file="$SESSIONS_DIR/$session_id"
+
+  if [[ ! -f "$session_file" ]]; then
+    log "Error: session '$session_id' not found in index." >&2
+    exit 1
+  fi
+
+  # Refuse deletion if any session is forked from this one.
+  local -a forks=()
+  for f in "$SESSIONS_DIR"/*; do
+    if [[ "$(read_session_field "$f" forked_from)" == "$session_id" ]]; then
+      forks+=("$(basename "$f")")
+    fi
+  done
+  if [[ ${#forks[@]} -gt 0 ]]; then
+    log "Error: session '$session_id' has forks and cannot be deleted." >&2
+    log "Delete all forked sessions first:" >&2
+    for fork in "${forks[@]}"; do
+      log "  $fork" >&2
+    done
+    exit 1
+  fi
+
+  local jsonl_file
+  jsonl_file=$(find "$CLAUDE_HOME/projects" -name "${session_id}.jsonl" 2>/dev/null | head -1)
+
+  local folder created last_active forked_from ts
+  folder=$(read_session_field "$session_file" folder)
+  forked_from=$(read_session_field "$session_file" forked_from)
+  ts=$(session_timestamps "$session_id")
+  created=$(echo "$ts" | sed -n '1p')
+  last_active=$(echo "$ts" | sed -n '2p')
+
+  echo ""
+  log "Session to delete:"
+  log "  id:          $session_id"
+  log "  folder:      $folder"
+  log "  created:     $created"
+  log "  last active: $last_active"
+  [[ -n "$forked_from" ]] && log "  forked from: $forked_from"
+  echo ""
+
+  confirm "Delete session $session_id?" || { log "Aborted."; exit 0; }
+
+  rm -f "$session_file"
+  [[ -n "$jsonl_file" ]] && rm -f "$jsonl_file"
+  log "Session $session_id deleted."
+}
+
+
+run_sandbox() {
+  # realpath resolves relative paths (e.g. ".") to absolute — required for Docker volume mounts
+  # Not declared local — the EXIT trap needs these values after the function returns
+  folder=$(realpath "$1")
+
+  log "Target folder: $folder"
+
+  if [[ ! -d "$folder" ]]; then
+    log "Error: '$folder' is not a directory" >&2
+    exit 1
+  fi
+
+  # Create config directory on first run
+  mkdir -p "$CLAUDE_HOME"
+  chmod 700 "$CLAUDE_HOME"
+
+  # Sorted list of session files before the run, used after to detect the newly created one.
+  # e.g. /home/user/.claude-sandbox/projects/-workspace/abc123.jsonl
+  #      /home/user/.claude-sandbox/projects/-workspace/def456.jsonl
+  # Not declared local — the EXIT trap needs these values after the function returns
+  snapshot=$(find "$CLAUDE_HOME/projects" -name "*.jsonl" 2>/dev/null | sort)
+
+  fix_ownership
+
+  echo ""
+  log "Container will mount:"
+  log "  $folder -> /workspace (read-write)"
+  log "  $CLAUDE_HOME -> /root/.claude (read-write)"
+  echo ""
+  confirm "Start Claude Code?" || { log "Aborted."; exit 0; }
+  echo ""
+
+  # Run cleanup on any exit — graceful (/q) or not (Ctrl+C, kill, crash).
+  # The JSONL file is written to the host volume in real time, so it exists even after a crash.
+  trap 'fix_ownership; record_session "$folder" "$snapshot"' EXIT
+
+  log "Starting Claude Code container"
+  run_container \
+    -it \
+    `# project folder — the only host directory Claude can read or write` \
+    -v "$folder":/workspace:rw \
+    `# Claude starts here instead of the container root` \
+    -w /workspace \
+    `# print OAuth URL to terminal if the user runs /login inside Claude` \
+    -e BROWSER=echo \
+    -- \
+    sh -c "${_SAVE_CREDENTIALS_TRAP}npx --yes @anthropic-ai/claude-code"
+
+  log "Session ended"
+}
+
+run_resume() {
+  local session_id="$1"
+  validate_session_id "$session_id"
+  local session_file="$SESSIONS_DIR/$session_id"
+
+  log "Looking up session $session_id"
+
+  if [[ ! -f "$session_file" ]]; then
+    log "Error: session '$session_id' not found in index." >&2
+    log "Sessions are only indexed for runs started with this script." >&2
+    exit 1
+  fi
+
+  local folder
+  folder=$(read_session_field "$session_file" folder)
+  log "Found session: folder=$folder"
+
+  if [[ ! -d "$folder" ]]; then
+    log "Error: original folder '$folder' no longer exists." >&2
+    exit 1
+  fi
+
+  fix_ownership
+
+  echo ""
+  log "Container will mount:"
+  log "  $folder -> /workspace (read-write)"
+  log "  $CLAUDE_HOME -> /root/.claude (read-write)"
+  echo ""
+  confirm "Resume session $session_id?" || { log "Aborted."; exit 0; }
+  echo ""
+
+  trap 'fix_ownership' EXIT
+
+  log "Starting Claude Code container (resuming session)"
+  run_container \
+    -it \
+    `# project folder — the only host directory Claude can read or write` \
+    -v "$folder":/workspace:rw \
+    `# Claude starts here instead of the container root` \
+    -w /workspace \
+    -e BROWSER=echo \
+    -- \
+    sh -c "${_SAVE_CREDENTIALS_TRAP}npx --yes @anthropic-ai/claude-code --resume '$session_id'"
+
+  log "Session ended"
+}
+
+run_fork() {
+  validate_session_id "$1"
+  local session_file="$SESSIONS_DIR/$1"
+  # Not declared local — the EXIT trap needs these values after the function returns
+  fork_source_id="$1"
+
+  log "Looking up session $fork_source_id"
+
+  if [[ ! -f "$session_file" ]]; then
+    log "Error: session '$fork_source_id' not found in index." >&2
+    log "Sessions are only indexed for runs started with this script." >&2
+    exit 1
+  fi
+
+  # Not declared local — the EXIT trap needs these values after the function returns
+  folder=$(read_session_field "$session_file" folder)
+  snapshot=$(find "$CLAUDE_HOME/projects" -name "*.jsonl" 2>/dev/null | sort)
+
+  log "Found session: folder=$folder"
+
+  if [[ ! -d "$folder" ]]; then
+    log "Error: original folder '$folder' no longer exists." >&2
+    exit 1
+  fi
+
+  fix_ownership
+
+  echo ""
+  log "Container will mount:"
+  log "  $folder -> /workspace (read-write)"
+  log "  $CLAUDE_HOME -> /root/.claude (read-write)"
+  echo ""
+  confirm "Fork session $fork_source_id?" || { log "Aborted."; exit 0; }
+  echo ""
+
+  # Record the new forked session, passing the source ID to write forked_from.
+  trap 'fix_ownership; record_session "$folder" "$snapshot" "$fork_source_id"' EXIT
+
+  log "Starting Claude Code container (forking session)"
+  run_container \
+    -it \
+    `# project folder — the only host directory Claude can read or write` \
+    -v "$folder":/workspace:rw \
+    `# Claude starts here instead of the container root` \
+    -w /workspace \
+    -e BROWSER=echo \
+    -- \
+    `# --fork-session creates a new session file branching from the resumed session` \
+    sh -c "${_SAVE_CREDENTIALS_TRAP}npx --yes @anthropic-ai/claude-code --resume '$fork_source_id' --fork-session"
+
+  log "Session ended"
+}
+
+# --- entry point ---
+
+# Guard allows the script to be sourced (e.g. for tests) without executing the entry point.
+[[ "${BASH_SOURCE[0]}" != "${0}" ]] && return
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage:" >&2
+  echo "  $(basename "$0") <folder-path>                # start a new session in that folder" >&2
+  echo "  $(basename "$0") sessions                     # list all recorded sessions" >&2
+  echo "  $(basename "$0") view-session <session-id>    # print the conversation from a session" >&2
+  echo "  $(basename "$0") resume <session-id>          # resume a previous session" >&2
+  echo "  $(basename "$0") fork-session <session-id>    # branch a new session from an existing one" >&2
+  echo "  $(basename "$0") sessions-for <folder-path>   # list sessions recorded for a folder" >&2
+  echo "  $(basename "$0") delete-session <session-id>              # delete a session and its conversation" >&2
+  echo "  $(basename "$0") register-session <jsonl-path> <folder>  # import an external session" >&2
+  exit 1
+fi
+
+case "$1" in
+  sessions)     list_sessions ;;
+  view-session) [[ $# -lt 2 ]] && { echo "Usage: $(basename "$0") view-session <session-id>" >&2; exit 1; }
+                view_session "$2" ;;
+  resume)       [[ $# -lt 2 ]] && { echo "Usage: $(basename "$0") resume <session-id>" >&2; exit 1; }
+                run_resume "$2" ;;
+  fork-session)    [[ $# -lt 2 ]] && { echo "Usage: $(basename "$0") fork-session <session-id>" >&2; exit 1; }
+                   run_fork "$2" ;;
+  sessions-for)    [[ $# -lt 2 ]] && { echo "Usage: $(basename "$0") sessions-for <folder-path>" >&2; exit 1; }
+                   sessions_for_folder "$2" ;;
+  delete-session)    [[ $# -lt 2 ]] && { echo "Usage: $(basename "$0") delete-session <session-id>" >&2; exit 1; }
+                     delete_session "$2" ;;
+  register-session)  [[ $# -lt 3 ]] && { echo "Usage: $(basename "$0") register-session <jsonl-path> <folder>" >&2; exit 1; }
+                     register_session "$2" "$3" ;;
+  *)            run_sandbox "$1" ;;
+esac
