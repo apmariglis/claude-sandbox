@@ -64,6 +64,9 @@ No separate login step required. On your first session, Claude Code will prompt 
 
 # Import an external session (see below)
 ./claude-sandbox register-session <jsonl-path> <folder-path>
+
+# Add or update a note on a session (shown in sessions list)
+./claude-sandbox annotate-session <session-id> [text]
 ```
 
 > **Note:** A session (including forks) only appears in `sessions` and `sessions-for` after the container exits — whether you quit with `/q`, close the terminal, or the container stops for any other reason. The session is recorded automatically on exit, and the `last active` timestamp is derived from the conversation log at that point.
@@ -78,6 +81,7 @@ No separate login step required. On your first session, Claude Code will prompt 
 ./claude-sandbox sessions-for ~/projects/my-app
 ./claude-sandbox fork-session f07c1c53-bd85-4c36-8dd6-22fb5eafbc4a
 ./claude-sandbox delete-session f07c1c53-bd85-4c36-8dd6-22fb5eafbc4a
+./claude-sandbox annotate-session f07c1c53-bd85-4c36-8dd6-22fb5eafbc4a "security audit"
 ```
 
 ## Importing external sessions
@@ -142,10 +146,11 @@ The tests work by sourcing the script (rather than running it as a subprocess), 
 |------|-----------------------|
 | `read_session_field` | Returns the correct value for a key; returns empty string for missing keys; handles `=` signs in values |
 | `write_session_file` | Creates an index file with the folder field; omits `forked_from` for new sessions; includes `forked_from` for forks |
+| `annotate_session` | Sets a note; clears a note when called with no text; prompts for confirmation before replacing or clearing an existing note; fails for invalid or missing session IDs |
 | `session_timestamps` | Extracts first and last timestamps from a JSONL file; returns `-` for both when no JSONL is found |
 | `sort_sessions_by_last_active` | Returns nothing with no arguments; sorts by `last_active` descending; sessions with no JSONL sort after those with timestamps |
 | `record_session` | Writes a session index entry when a new JSONL appears after a run; records `forked_from` when a source ID is provided; does nothing when no new JSONL is detected |
-| `list_sessions` | Prints a message when no sessions exist; shows each session's ID and folder; groups forks under their parent with a `(fork)` prefix; sorts root sessions by `last_active` descending |
+| `list_sessions` | Prints a message when no sessions exist; shows each session's ID and folder; groups forks under their parent with a `(fork)` prefix; sorts root sessions by `last_active` descending; shows annotation below sessions that have one |
 | `sessions_for_folder` | Shows only sessions matching the given folder; prints a message when no sessions match; groups forks under their parent |
 | `view_session` | Accepts a direct file path; accepts a session ID and locates the JSONL automatically; fails with an error when no JSONL is found for the given ID |
 | `register_session` | Copies the JSONL and creates an index entry; fails if the session is already registered; fails if the source file does not exist; fails if the source file does not have a `.jsonl` extension |

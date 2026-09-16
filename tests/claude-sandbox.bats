@@ -109,6 +109,63 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------
+# annotate_session
+# ---------------------------------------------------------------------------
+
+@test "annotate_session sets a note on a session" {
+  printf "folder=/some/path\n" > "$SESSIONS_DIR/test-session"
+
+  annotate_session "test-session" "security audit"
+
+  run read_session_field "$SESSIONS_DIR/test-session" note
+  [ "$output" = "security audit" ]
+}
+
+@test "annotate_session clears a note when called with no text" {
+  printf "folder=/some/path\nnote=old note\n" > "$SESSIONS_DIR/test-session"
+  confirm() { return 0; }
+
+  annotate_session "test-session" ""
+
+  run read_session_field "$SESSIONS_DIR/test-session" note
+  [ "$output" = "" ]
+}
+
+@test "annotate_session replaces an existing note after confirmation" {
+  printf "folder=/some/path\nnote=old note\n" > "$SESSIONS_DIR/test-session"
+  confirm() { return 0; }
+
+  annotate_session "test-session" "new note"
+
+  run read_session_field "$SESSIONS_DIR/test-session" note
+  [ "$output" = "new note" ]
+}
+
+@test "annotate_session aborts replacement when confirmation is declined" {
+  printf "folder=/some/path\nnote=keep this\n" > "$SESSIONS_DIR/test-session"
+  confirm() { return 1; }
+
+  annotate_session "test-session" "new note"
+
+  run read_session_field "$SESSIONS_DIR/test-session" note
+  [ "$output" = "keep this" ]
+}
+
+@test "annotate_session fails if the session does not exist" {
+  run annotate_session "no-such-session" "hello"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not found"* ]]
+}
+
+@test "annotate_session rejects an invalid session ID" {
+  run annotate_session "../../etc/passwd" "hello"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid session ID"* ]]
+}
+
+# ---------------------------------------------------------------------------
 # session_timestamps
 # ---------------------------------------------------------------------------
 
@@ -240,6 +297,22 @@ teardown() {
   pos_b=$(echo "$output" | grep -n "bbbb-2222" | head -1 | cut -d: -f1)
   # bbbb-2222 has more recent last_active, must appear first
   [ "$pos_b" -lt "$pos_a" ]
+}
+
+@test "list_sessions shows NOTE column header" {
+  printf "folder=/project/a\n" > "$SESSIONS_DIR/aaaa-1111"
+
+  run list_sessions
+
+  [[ "$output" == *"NOTE"* ]]
+}
+
+@test "list_sessions shows note inline for a session that has one" {
+  printf "folder=/project/a\nnote=security audit\n" > "$SESSIONS_DIR/aaaa-1111"
+
+  run list_sessions
+
+  [[ "$output" == *"security audit"* ]]
 }
 
 # ---------------------------------------------------------------------------

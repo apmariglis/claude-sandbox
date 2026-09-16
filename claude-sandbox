@@ -63,6 +63,26 @@ write_session_file() {
   } > "$session_file"
 }
 
+annotate_session() {
+  local session_id="$1" note="${2:-}"
+  validate_session_id "$session_id"
+  local session_file="$SESSIONS_DIR/$session_id"
+  [[ -f "$session_file" ]] || { log "Error: session '$session_id' not found." >&2; exit 1; }
+  local existing
+  existing=$(read_session_field "$session_file" note)
+  if [[ -n "$existing" ]]; then
+    if [[ -n "$note" ]]; then
+      confirm "Replace note '$existing' with '$note'?" || { log "Aborted."; return 0; }
+    else
+      confirm "Clear note '$existing'?" || { log "Aborted."; return 0; }
+    fi
+  fi
+  { grep -v "^note=" "$session_file" || true; } > "$session_file.tmp"
+  [[ -n "$note" ]] && printf "note=%s\n" "$note" >> "$session_file.tmp"
+  mv "$session_file.tmp" "$session_file"
+  [[ -n "$note" ]] && log "Note set for $session_id." || log "Note cleared for $session_id."
+}
+
 # Output session IDs sorted by last_active descending (most recent first).
 sort_sessions_by_last_active() {
   if [[ $# -eq 0 ]]; then return; fi
@@ -169,13 +189,14 @@ sessions_for_folder() {
   fi
 
   # First pass: collect data for sessions matching this folder; separate roots from forks.
-  declare -A s_forked_from
+  declare -A s_forked_from s_note
   local -a root_ids=()
   for f in "$SESSIONS_DIR"/*; do
     local sid
     sid=$(basename "$f")
     if [[ "$(read_session_field "$f" folder)" == "$folder" ]]; then
       s_forked_from[$sid]=$(read_session_field "$f" forked_from)
+      s_note[$sid]=$(read_session_field "$f" note)
       if [[ -z "${s_forked_from[$sid]}" ]]; then
         root_ids+=("$sid")
       fi
@@ -188,8 +209,8 @@ sessions_for_folder() {
   fi
 
   echo ""
-  printf "%-40s  %-20s  %-20s\n" "SESSION ID" "CREATED" "LAST ACTIVE"
-  printf "%-40s  %-20s  %-20s\n" "----------" "-------" "-----------"
+  printf "%-40s  %-20s  %-20s  %s\n" "SESSION ID" "CREATED" "LAST ACTIVE" "NOTE"
+  printf "%-40s  %-20s  %-20s  %s\n" "----------" "-------" "-----------" "----"
 
   # Second pass: print root sessions sorted by last_active, each followed by its descendants.
   local sorted_sid
@@ -198,7 +219,7 @@ sessions_for_folder() {
     ts=$(session_timestamps "$sorted_sid")
     created=$(echo "$ts" | sed -n '1p')
     last_active=$(echo "$ts" | sed -n '2p')
-    printf "%-40s  %-20s  %-20s\n" "$sorted_sid" "$created" "$last_active"
+    printf "%-40s  %-20s  %-20s  %s\n" "$sorted_sid" "$created" "$last_active" "${s_note[$sorted_sid]:-}"
 
     local -a queue=("0|$sorted_sid")
     while [[ ${#queue[@]} -gt 0 ]]; do
@@ -221,8 +242,8 @@ sessions_for_folder() {
         local fts flast_active
         fts=$(session_timestamps "$sorted_fsid")
         flast_active=$(echo "$fts" | sed -n '2p')
-        printf "%*s(fork) %-32s  %-20s  %-20s\n" \
-          "$(( next_depth * 2 - 1 ))" "" "$sorted_fsid" "" "$flast_active"
+        printf "%*s(fork) %-32s  %-20s  %-20s  %s\n" \
+          "$(( next_depth * 2 - 1 ))" "" "$sorted_fsid" "" "$flast_active" "${s_note[$sorted_fsid]:-}"
         queue+=("$next_depth|$sorted_fsid")
       done < <(sort_sessions_by_last_active "${fork_children[@]}")
     done
@@ -238,17 +259,18 @@ list_sessions() {
   fi
 
   echo ""
-  printf "%-40s  %-20s  %-20s  %s\n" "SESSION ID" "CREATED" "LAST ACTIVE" "FOLDER"
-  printf "%-40s  %-20s  %-20s  %s\n" "----------" "-------" "-----------" "------"
+  printf "%-40s  %-20s  %-20s  %-24s  %s\n" "SESSION ID" "CREATED" "LAST ACTIVE" "NOTE" "FOLDER"
+  printf "%-40s  %-20s  %-20s  %-24s  %s\n" "----------" "-------" "-----------" "----" "------"
 
-  # First pass: collect folder and forked_from for all sessions; separate roots from forks.
-  declare -A s_folder s_forked_from
+  # First pass: collect folder, forked_from, and note for all sessions; separate roots from forks.
+  declare -A s_folder s_forked_from s_note
   local -a root_ids=()
   for f in "$SESSIONS_DIR"/*; do
     local sid
     sid=$(basename "$f")
     s_folder[$sid]=$(read_session_field "$f" folder)
     s_forked_from[$sid]=$(read_session_field "$f" forked_from)
+    s_note[$sid]=$(read_session_field "$f" note)
     if [[ -z "${s_forked_from[$sid]}" ]]; then
       root_ids+=("$sid")
     fi
@@ -261,7 +283,8 @@ list_sessions() {
     ts=$(session_timestamps "$sorted_sid")
     created=$(echo "$ts" | sed -n '1p')
     last_active=$(echo "$ts" | sed -n '2p')
-    printf "%-40s  %-20s  %-20s  %s\n" "$sorted_sid" "$created" "$last_active" "${s_folder[$sorted_sid]}"
+    printf "%-40s  %-20s  %-20s  %-24s  %s\n" \
+      "$sorted_sid" "$created" "$last_active" "${s_note[$sorted_sid]:-}" "${s_folder[$sorted_sid]}"
 
     # Queue entries are "depth|session_id"; depth drives indentation for nested forks.
     local -a queue=("0|$sorted_sid")
@@ -286,8 +309,9 @@ list_sessions() {
         local fts flast_active
         fts=$(session_timestamps "$sorted_fsid")
         flast_active=$(echo "$fts" | sed -n '2p')
-        printf "%*s(fork) %-32s  %-20s  %-20s  %s\n" \
-          "$(( next_depth * 2 - 1 ))" "" "$sorted_fsid" "" "$flast_active" "${s_folder[$sorted_fsid]:-}"
+        printf "%*s(fork) %-32s  %-20s  %-20s  %-24s  %s\n" \
+          "$(( next_depth * 2 - 1 ))" "" "$sorted_fsid" "" "$flast_active" \
+          "${s_note[$sorted_fsid]:-}" "${s_folder[$sorted_fsid]:-}"
         queue+=("$next_depth|$sorted_fsid")
       done < <(sort_sessions_by_last_active "${fork_children[@]}")
     done
@@ -604,6 +628,7 @@ if [[ $# -lt 1 ]]; then
   echo "  $(basename "$0") sessions-for <folder-path>   # list sessions recorded for a folder" >&2
   echo "  $(basename "$0") delete-session <session-id>              # delete a session and its conversation" >&2
   echo "  $(basename "$0") register-session <jsonl-path> <folder>  # import an external session" >&2
+  echo "  $(basename "$0") annotate-session <session-id> [text]    # set or clear a note on a session" >&2
   exit 1
 fi
 
@@ -621,5 +646,7 @@ case "$1" in
                      delete_session "$2" ;;
   register-session)  [[ $# -lt 3 ]] && { echo "Usage: $(basename "$0") register-session <jsonl-path> <folder>" >&2; exit 1; }
                      register_session "$2" "$3" ;;
+  annotate-session) [[ $# -lt 2 ]] && { echo "Usage: $(basename "$0") annotate-session <session-id> [text]" >&2; exit 1; }
+                    annotate_session "$2" "${3:-}" ;;
   *)            run_sandbox "$1" ;;
 esac
