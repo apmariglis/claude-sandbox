@@ -155,28 +155,38 @@ record_session() {
 
   log "Looking for new session file"
 
-  # Claude Code does not expose the session ID it creates, so we detect it by comparing
+  # Claude Code does not expose the session IDs it creates, so we detect them by comparing
   # the list of .jsonl files before and after the run.
+  # -maxdepth 2 limits to projects/-workspace/*.jsonl, excluding subagent files nested at
+  # projects/-workspace/<UUID>/subagents/agent-*.jsonl (depth 4).
   # comm -13 outputs lines only in the second input — i.e. files that didn't exist before.
-  # snapshot (before):  abc.jsonl / def.jsonl
-  # find output (after): abc.jsonl / def.jsonl / ghi.jsonl
-  # comm -13 result:    ghi.jsonl  <- the new session
-  local new_session
-  new_session=$(comm -13 \
+  local new_sessions
+  new_sessions=$(comm -13 \
     <(echo "$snapshot") \
-    <(find "$CLAUDE_HOME/projects" -name "*.jsonl" 2>/dev/null | sort) | head -1)
+    <(find "$CLAUDE_HOME/projects" -maxdepth 2 -name "*.jsonl" 2>/dev/null | sort))
 
-  if [[ -n "$new_session" ]]; then
-    # Strip directory and .jsonl extension to get the UUID
+  if [[ -z "$new_sessions" ]]; then
+    log "No new session file detected"
+    return
+  fi
+
+  # Record every new session. The first one gets forked_from (it's the one Claude Code
+  # created directly from the fork command); subsequent ones are auto-forks created
+  # internally during the conversation.
+  local first=1
+  while IFS= read -r new_session; do
     local session_id
     session_id=$(basename "$new_session" .jsonl)
-    validate_session_id "$session_id"
+    ( validate_session_id "$session_id" ) 2>/dev/null || continue
     mkdir -p "$SESSIONS_DIR"
-    write_session_file "$SESSIONS_DIR/$session_id" "$folder" "$source_id"
+    if [[ $first -eq 1 ]]; then
+      write_session_file "$SESSIONS_DIR/$session_id" "$folder" "$source_id"
+      first=0
+    else
+      write_session_file "$SESSIONS_DIR/$session_id" "$folder"
+    fi
     log "Session recorded: $session_id -> $folder"
-  else
-    log "No new session file detected"
-  fi
+  done <<< "$new_sessions"
 }
 
 sessions_for_folder() {
@@ -402,7 +412,8 @@ register_session() {
 
   confirm "Register session?" || { log "Aborted."; exit 0; }
 
-  cp "$jsonl_path" "$dest_dir/$session_id.jsonl"
+  local dest="$dest_dir/$session_id.jsonl"
+  [[ "$(realpath "$jsonl_path")" != "$(realpath "$dest" 2>/dev/null || echo "$dest")" ]] && cp "$jsonl_path" "$dest"
   mkdir -p "$SESSIONS_DIR"
   write_session_file "$SESSIONS_DIR/$session_id" "$folder"
   log "Session $session_id registered."
@@ -481,7 +492,7 @@ run_sandbox() {
   # e.g. /home/user/.claude-sandbox/projects/-workspace/abc123.jsonl
   #      /home/user/.claude-sandbox/projects/-workspace/def456.jsonl
   # Not declared local — the EXIT trap needs these values after the function returns
-  snapshot=$(find "$CLAUDE_HOME/projects" -name "*.jsonl" 2>/dev/null | sort)
+  snapshot=$(find "$CLAUDE_HOME/projects" -maxdepth 2 -name "*.jsonl" 2>/dev/null | sort)
 
   fix_ownership
 
@@ -576,7 +587,7 @@ run_fork() {
 
   # Not declared local — the EXIT trap needs these values after the function returns
   folder=$(read_session_field "$session_file" folder)
-  snapshot=$(find "$CLAUDE_HOME/projects" -name "*.jsonl" 2>/dev/null | sort)
+  snapshot=$(find "$CLAUDE_HOME/projects" -maxdepth 2 -name "*.jsonl" 2>/dev/null | sort)
 
   log "Found session: folder=$folder"
 

@@ -198,7 +198,7 @@ teardown() {
   printf '{}' > "$projects_dir/existing.jsonl"
 
   local snapshot
-  snapshot=$(find "$CLAUDE_HOME/projects" -name "*.jsonl" | sort)
+  snapshot=$(find "$CLAUDE_HOME/projects" -maxdepth 2 -name "*.jsonl" | sort)
 
   printf '{}' > "$projects_dir/new-session-id.jsonl"
 
@@ -214,7 +214,7 @@ teardown() {
   mkdir -p "$projects_dir"
 
   local snapshot
-  snapshot=$(find "$CLAUDE_HOME/projects" -name "*.jsonl" | sort)
+  snapshot=$(find "$CLAUDE_HOME/projects" -maxdepth 2 -name "*.jsonl" | sort)
 
   printf '{}' > "$projects_dir/forked-session-id.jsonl"
 
@@ -230,11 +230,62 @@ teardown() {
   printf '{}' > "$projects_dir/existing.jsonl"
 
   local snapshot
-  snapshot=$(find "$CLAUDE_HOME/projects" -name "*.jsonl" | sort)
+  snapshot=$(find "$CLAUDE_HOME/projects" -maxdepth 2 -name "*.jsonl" | sort)
 
   record_session "/my/project" "$snapshot"
 
   [ -z "$(ls -A "$SESSIONS_DIR")" ]
+}
+
+@test "record_session records all new jsonl files when multiple appear" {
+  local projects_dir="$CLAUDE_HOME/projects/-workspace"
+  mkdir -p "$projects_dir"
+
+  local snapshot
+  snapshot=$(find "$CLAUDE_HOME/projects" -maxdepth 2 -name "*.jsonl" | sort)
+
+  printf '{}' > "$projects_dir/aaaa-session-id.jsonl"
+  printf '{}' > "$projects_dir/bbbb-session-id.jsonl"
+
+  record_session "/my/project" "$snapshot"
+
+  [ -f "$SESSIONS_DIR/aaaa-session-id" ]
+  [ -f "$SESSIONS_DIR/bbbb-session-id" ]
+}
+
+@test "record_session assigns forked_from only to the first new session" {
+  local projects_dir="$CLAUDE_HOME/projects/-workspace"
+  mkdir -p "$projects_dir"
+
+  local snapshot
+  snapshot=$(find "$CLAUDE_HOME/projects" -maxdepth 2 -name "*.jsonl" | sort)
+
+  printf '{}' > "$projects_dir/aaaa-session-id.jsonl"
+  printf '{}' > "$projects_dir/bbbb-session-id.jsonl"
+
+  record_session "/my/project" "$snapshot" "source-session-id"
+
+  run read_session_field "$SESSIONS_DIR/aaaa-session-id" forked_from
+  [ "$output" = "source-session-id" ]
+
+  run read_session_field "$SESSIONS_DIR/bbbb-session-id" forked_from
+  [ "$output" = "" ]
+}
+
+@test "record_session ignores subagent jsonl files nested in subdirectories" {
+  local projects_dir="$CLAUDE_HOME/projects/-workspace"
+  mkdir -p "$projects_dir/aaaa-session-id/subagents"
+
+  local snapshot
+  snapshot=$(find "$CLAUDE_HOME/projects" -maxdepth 2 -name "*.jsonl" | sort)
+
+  printf '{}' > "$projects_dir/aaaa-session-id.jsonl"
+  printf '{}' > "$projects_dir/aaaa-session-id/subagents/agent-1.jsonl"
+
+  record_session "/my/project" "$snapshot"
+
+  [ -f "$SESSIONS_DIR/aaaa-session-id" ]
+  [ ! -f "$SESSIONS_DIR/agent-1" ]
 }
 
 # ---------------------------------------------------------------------------
